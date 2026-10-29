@@ -351,11 +351,25 @@ impl LocalJwtConfig {
 
 		let mut providers = Vec::with_capacity(providers_cfg.len());
 		for pc in providers_cfg {
-			let jwks: JwkSet = pc
+			let jwks: JwkSet = match pc
 				.jwks
 				.load::<JwkSet>(resources, crate::resource_manager::ResourceKind::Jwks)
 				.await
-				.map_err(JwkError::JwkLoadError)?;
+			{
+				Ok(jwks) => jwks,
+				Err(e) => {
+					let serdes::FileInlineOrRemote::Remote { url } = &pc.jwks else {
+						return Err(JwkError::JwkLoadError(e));
+					};
+					// Tokens from this issuer cannot be verified, so they fail authentication.
+					tracing::warn!(
+						issuer = %pc.issuer,
+						jwks = %url,
+						"skipping JWT provider: failed to load remote JWKS: {e}"
+					);
+					continue;
+				},
+			};
 			let provider = Provider::from_jwks(jwks, pc.issuer, pc.audiences, pc.jwt_validation_options)?;
 			providers.push(provider);
 		}

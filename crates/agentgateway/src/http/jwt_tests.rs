@@ -1317,3 +1317,88 @@ pub fn test_required_claims_with_nbf_rejects_missing_nbf() {
 		"required_claims with nbf should reject tokens missing nbf claim"
 	);
 }
+
+fn test_jwks(kid: &str) -> serde_json::Value {
+	json!({
+		"keys": [
+			{
+				"use": "sig",
+				"kty": "EC",
+				"kid": kid,
+				"crv": "P-256",
+				"alg": "ES256",
+				"x": "WM7udBHga09KxC5kxq6GhrZ9M3Y8S9ZThq_XxsOcDhk",
+				"y": "xc7T4afkXmwjEbJMzQXCdQcU3PZKiLFlHl23GE1z4ug"
+			}
+		]
+	})
+}
+
+#[tokio::test]
+pub async fn test_try_into_skips_provider_with_unreachable_remote_jwks() {
+	let server = wiremock::MockServer::start().await;
+	wiremock::Mock::given(wiremock::matchers::path("/jwks"))
+		.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(test_jwks("kid-2")))
+		.mount(&server)
+		.await;
+	let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
+		.unwrap()
+		.local_addr()
+		.unwrap();
+
+	let inline_issuer = "https://inline.example.com";
+	let remote_issuer = "https://remote.example.com";
+	let down_issuer = "https://down.example.com";
+	let config: LocalJwtConfig = serde_json::from_value(json!({
+		"mode": "strict",
+		"providers": [
+			{"issuer": inline_issuer, "jwks": test_jwks("kid-1").to_string()},
+			{"issuer": down_issuer, "jwks": {"url": format!("http://{unreachable}/jwks")}},
+			{"issuer": remote_issuer, "jwks": {"url": format!("{}/jwks", server.uri())}},
+		]
+	}))
+	.unwrap();
+	let resources =
+		crate::resource_manager::ResourceFetcher::direct(crate::test_helpers::test_client());
+	let jwt = config
+		.try_into(&resources)
+		.await
+		.expect("an unreachable JWKS must not fail the whole JWT config");
+
+	assert_eq!(jwt.mode, Mode::Strict);
+	assert_eq!(
+		jwt
+			.providers
+			.iter()
+			.map(|p| p.issuer.as_str())
+			.collect_vec(),
+		vec![inline_issuer, remote_issuer]
+	);
+	let exp = jsonwebtoken::get_current_timestamp() + 600;
+	for (kid, iss) in [("kid-1", inline_issuer), ("kid-2", remote_issuer)] {
+		let token = build_signed_token(kid, iss, "aud", exp);
+		assert!(
+			jwt.validate_claims(&token).is_ok(),
+			"token from {iss} should validate"
+		);
+	}
+	let token = build_signed_token("kid-3", down_issuer, "aud", exp);
+	assert!(matches!(
+		jwt.validate_claims(&token),
+		Err(TokenError::UnknownKeyId(kid)) if kid == "kid-3"
+	));
+}
+
+#[tokio::test]
+pub async fn test_try_into_rejects_invalid_inline_jwks() {
+	let config: LocalJwtConfig = serde_json::from_value(json!({
+		"issuer": "https://inline.example.com",
+		"jwks": "not a jwks",
+	}))
+	.unwrap();
+	let resources = crate::resource_manager::ResourceFetcher::files_only();
+	assert!(matches!(
+		config.try_into(&resources).await,
+		Err(JwkError::JwkLoadError(_))
+	));
+}

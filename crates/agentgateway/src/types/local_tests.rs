@@ -1785,6 +1785,69 @@ binds:
 }
 
 #[tokio::test]
+async fn test_local_jwt_auth_unreachable_remote_jwks_skips_provider() {
+	use crate::http::jwt::tests::build_signed_token_with_payload;
+
+	let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
+		.unwrap()
+		.local_addr()
+		.unwrap();
+	let input = format!(
+		r#"
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - matches:
+      - path:
+          pathPrefix: /protected
+      policies:
+        jwtAuth:
+          mode: strict
+          providers:
+          - issuer: https://inline.example.com
+            jwks: '{{"keys":[{{"kty":"EC","kid":"kid-1","crv":"P-256","alg":"ES256","x":"WM7udBHga09KxC5kxq6GhrZ9M3Y8S9ZThq_XxsOcDhk","y":"xc7T4afkXmwjEbJMzQXCdQcU3PZKiLFlHl23GE1z4ug"}}]}}'
+          - issuer: https://down.example.com
+            jwks:
+              url: http://{unreachable}/jwks
+      backends:
+      - host: 127.0.0.1:8000
+    - backends:
+      - host: 127.0.0.1:8001
+"#
+	);
+
+	let normalized = normalize_test_yaml(&input)
+		.await
+		.expect("an unreachable JWKS must not fail the local config");
+	let routes = &normalized.listener_routes[0].1;
+	assert_eq!(routes.len(), 2);
+	let Some(TrafficPolicy::JwtAuth(jwt_auth)) = routes[0]
+		.inline_policies
+		.iter()
+		.find(|policy| matches!(policy, TrafficPolicy::JwtAuth(_)))
+	else {
+		panic!("expected jwtAuth policy");
+	};
+	let jwt = &jwt_auth.iter().next().unwrap().pol.jwt;
+	let exp = jsonwebtoken::get_current_timestamp() + 600;
+	let token = |iss: &str| {
+		build_signed_token_with_payload("kid-1", serde_json::json!({"iss": iss, "exp": exp}))
+	};
+	assert!(
+		jwt
+			.validate_claims(&token("https://inline.example.com"))
+			.is_ok()
+	);
+	assert!(
+		jwt
+			.validate_claims(&token("https://down.example.com"))
+			.is_err()
+	);
+	assert!(routes[1].inline_policies.is_empty());
+}
+
+#[tokio::test]
 async fn test_local_ext_authz_http_include_response_headers() {
 	let input = r#"
 binds:
